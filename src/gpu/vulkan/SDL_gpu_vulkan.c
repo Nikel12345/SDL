@@ -643,6 +643,24 @@ typedef Uint32 VulkanBufferUsageModeFlags;
 #define VULKAN_BUFFER_USAGE_MODE_COMPUTE_STORAGE_READ           (1u << 6)
 #define VULKAN_BUFFER_USAGE_MODE_COMPUTE_STORAGE_READ_WRITE     (1u << 7)
 
+/* ENGINE-FORK: which usage bits are EXPRESSIBLE in a barrier on a queue of a given
+ * family.
+ *
+ * SetMemoryBarrierFlags turns these bits into pipeline stages (VERTEX_READ ->
+ * VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, COMPUTE_STORAGE_READ -> COMPUTE_SHADER, and so
+ * on). On a queue without VK_QUEUE_GRAPHICS_BIT/COMPUTE_BIT those stages do not
+ * exist, and a barrier naming them is invalid. So the usage bits are masked by the
+ * queue the command buffer is being recorded for, just before the barrier is emitted.
+ *
+ * The mask is a property of the PAIR (resource, queue), not of the resource: the
+ * buffer never loses its own usage flags. It must not reach resource creation
+ * (VULKAN_INTERNAL_CreateBuffer) -- a buffer created without VERTEX would be unusable
+ * for drawing forever after.
+ */
+#define VULKAN_BUFFER_USAGE_MODE_MASK_GRAPHICS  0xFFFFFFFFu
+#define VULKAN_BUFFER_USAGE_MODE_MASK_TRANSFER  (VULKAN_BUFFER_USAGE_MODE_COPY_SOURCE | \
+                                                 VULKAN_BUFFER_USAGE_MODE_COPY_DESTINATION)
+
 typedef enum VulkanTextureUsageMode
 {
     VULKAN_TEXTURE_USAGE_MODE_UNINITIALIZED,
@@ -1088,6 +1106,13 @@ struct VulkanCommandPool
 {
     SDL_ThreadID threadID;
     VkCommandPool commandPool;
+
+    /* ENGINE-FORK: mask of usage bits expressible on this family's queue (see
+     * VULKAN_BUFFER_USAGE_MODE_MASK_*). It lives on the pool rather than on the command
+     * buffer because it is a property of the FAMILY: the pool is already created with a
+     * queueFamilyIndex, so once the pool key becomes (threadID, family) the mask
+     * travels with it without touching a single barrier emission site. */
+    VulkanBufferUsageModeFlags queueUsageModeMask;
 
     VulkanCommandBuffer **inactiveCommandBuffers;
     Uint32 inactiveCommandBufferCapacity;
@@ -2658,6 +2683,12 @@ static void VULKAN_INTERNAL_BufferMemoryBarrier(
     memoryBarrier.offset = 0;
     memoryBarrier.size = buffer->size;
 
+    /* ENGINE-FORK: drop the bits that are not expressible on this command buffer's queue.
+     * On a graphics/unified queue the mask passes everything through, so behaviour is
+     * unchanged. */
+    sourceUsageMode &= commandBuffer->commandPool->queueUsageModeMask;
+    destinationUsageMode &= commandBuffer->commandPool->queueUsageModeMask;
+
     VULKAN_INTERNAL_SetMemoryBarrierFlags(
         sourceUsageMode,
         &srcStages,
@@ -2667,6 +2698,22 @@ static void VULKAN_INTERNAL_BufferMemoryBarrier(
         destinationUsageMode,
         &dstStages,
         &memoryBarrier.dstAccessMask);
+
+    /* ENGINE-FORK: an empty mask is NOT the same as zero stages -- a barrier naming no
+     * stage at all is invalid. An empty side is expressed by the explicit form of "there
+     * is no producer/consumer here":
+     *   dst empty -> BOTTOM_OF_PIPE: make the write available, nobody on this queue waits (release);
+     *   src empty -> TOP_OF_PIPE:    there is nothing on this queue to wait for (acquire).
+     * The corresponding access mask must stay zero -- and it already is, because
+     * SetMemoryBarrierFlags only ever sets access bits together with stages.
+     * Visibility across queues is closed not by this barrier but by the frame's submit
+     * fence. */
+    if (srcStages == 0) {
+        srcStages = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+    }
+    if (dstStages == 0) {
+        dstStages = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
+    }
 
     renderer->vkCmdPipelineBarrier(
         commandBuffer->commandBuffer,
@@ -2697,6 +2744,30 @@ static void VULKAN_INTERNAL_TextureMemoryBarrier(
     VkPipelineStageFlags srcStages = 0;
     VkPipelineStageFlags dstStages = 0;
     VkImageMemoryBarrier memoryBarrier;
+
+    /* ENGINE-FORK: a texture barrier is NOT masked -- the state is checked as a whole.
+     *
+     * The difference from buffers is fundamental. Buffer usage bits accumulate
+     * (DefaultBufferUsageMode ORs them together), so masking a buffer removes addends and
+     * leaves the rest correct. A texture mode is picked as the first match by priority
+     * (DefaultTextureUsageMode, a chain of else-ifs with SAMPLER first), and that is not a
+     * "set of bits" but a MEMORY LAYOUT. There is nothing to strip: a mask would change
+     * the answer wholesale -- a copy queue that "knows nothing about" SAMPLER would leave
+     * the image in copy-destination form while SDL went on believing it ready to be read.
+     * The invariant "between operations a resource sits in its default state" would break
+     * silently: validation says nothing, and it surfaces as garbage on screen.
+     *
+     * So the line is not drawn between "textures vs buffers" but between "has a layout vs
+     * has none". The assert is a second line of defence: the first one, command buffer
+     * types on the engine side, keeps a texture operation off a lane that cannot carry it.
+     *
+     * What is checked is EXPRESSIBILITY, not "is this the graphics queue": a compute queue
+     * expresses COMPUTE_STORAGE states legitimately, and forbidding them would shut the
+     * compute lane out of its own storage textures. What it cannot have is SAMPLER and
+     * render targets. */
+    SDL_assert_release(
+        commandBuffer->commandPool->queueUsageModeMask == VULKAN_BUFFER_USAGE_MODE_MASK_GRAPHICS &&
+        "Texture barrier on a non-graphics queue!");
 
     memoryBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
     memoryBarrier.pNext = NULL;
@@ -9621,6 +9692,11 @@ static VulkanCommandPool *VULKAN_INTERNAL_FetchCommandPool(
     }
 
     vulkanCommandPool->threadID = threadID;
+    /* ENGINE-FORK: while there is a single queue and it is the graphics one, the mask lets
+     * everything through and barrier emission does not change by a single bit. Once a
+     * second (copy) family appears, its pools will pick up
+     * VULKAN_BUFFER_USAGE_MODE_MASK_TRANSFER right here. */
+    vulkanCommandPool->queueUsageModeMask = VULKAN_BUFFER_USAGE_MODE_MASK_GRAPHICS;
 
     vulkanCommandPool->inactiveCommandBufferCapacity = 0;
     vulkanCommandPool->inactiveCommandBufferCount = 0;
