@@ -568,7 +568,9 @@ typedef struct SDL_GPUCommandBuffer SDL_GPUCommandBuffer;
 typedef enum SDL_GPUQueueType
 {
     SDL_GPU_QUEUETYPE_GRAPHICS,  /**< Everything: render, compute and copy passes, mipmaps, blits, swapchain. */
-    SDL_GPU_QUEUETYPE_TRANSFER   /**< Copies only. Falls back to the graphics queue when unavailable. */
+    SDL_GPU_QUEUETYPE_COMPUTE,   /**< Compute and copy passes. No render passes, mipmaps, blits or swapchain. */
+    SDL_GPU_QUEUETYPE_TRANSFER,  /**< Copy passes only. */
+    SDL_GPU_QUEUETYPE_COUNT      /**< Not a queue. Number of queue types, for sizing arrays. */
 } SDL_GPUQueueType;
 
 /**
@@ -3202,9 +3204,17 @@ extern SDL_DECLSPEC SDL_GPUCommandBuffer * SDLCALL SDL_AcquireGPUCommandBuffer(
  * buffer. Callers therefore never need to branch on availability -- the same
  * code is correct either way, and only the amount of overlap changes.
  *
- * A transfer command buffer accepts copy passes only. Render passes, compute
- * passes, mipmap generation, blits and swapchain acquisition have no meaning
- * on a copy queue and must not be recorded onto one.
+ * What each queue type accepts is a strict nesting -- TRANSFER is a subset of
+ * COMPUTE, which is a subset of GRAPHICS:
+ *
+ * - TRANSFER: copy passes.
+ * - COMPUTE: copy passes, compute passes.
+ * - GRAPHICS: the above, plus render passes, mipmap generation, blits and
+ *   swapchain acquisition.
+ *
+ * Mipmap generation and blits are drawing operations (they are implemented
+ * with the graphics blit command), which is why they stay GRAPHICS-only no
+ * matter what the resource was created for.
  *
  * \param device a GPU context.
  * \param queue_type which queue the command buffer will be submitted to.

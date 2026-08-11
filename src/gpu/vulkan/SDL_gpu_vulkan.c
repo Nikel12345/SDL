@@ -1183,13 +1183,20 @@ struct VulkanRenderer
     Uint32 queueFamilyIndex;
     VkQueue unifiedQueue;
 
-    /* ENGINE-FORK: the family behind SDL_GPU_QUEUETYPE_TRANSFER. Until a dedicated one is
-     * set up it is EQUAL to queueFamilyIndex -- and that equality is precisely how the
-     * fallback works: mapping the role to a family (VULKAN_AcquireCommandBuffer) simply
-     * hands back the same family, and neither the pool key nor anything below it ever
-     * learns that there is no second queue. When a dedicated family does appear, one
-     * assignment at device creation changes; the rest of the code is already in place. */
-    Uint32 transferQueueFamilyIndex;
+    /* ENGINE-FORK: the family and queue for EACH role, indexed by SDL_GPUQueueType.
+     *
+     * A table rather than one field per role: mapping a role to a family becomes a
+     * single indexed load with no branching, and adding a role touches no code at all.
+     *
+     * The fallback is expressed by HOW THE TABLE IS FILLED, not by checks: a role with
+     * no family of its own is given the graphics one. Nothing downstream -- role
+     * mapping, pool key, submission -- ever has to ask "does that queue exist?".
+     *
+     * queueFamilyIndex/unifiedQueue above are left alone: upstream code depends on them
+     * (swapchain, resource creation), and they are always equal to the graphics entry
+     * of these tables. */
+    Uint32  queueFamilyIndices[SDL_GPU_QUEUETYPE_COUNT];
+    VkQueue queues[SDL_GPU_QUEUETYPE_COUNT];
 
     VulkanCommandBuffer **submittedCommandBuffers;
     Uint32 submittedCommandBufferCount;
@@ -9791,10 +9798,7 @@ static SDL_GPUCommandBuffer *VULKAN_AcquireCommandBuffer(
      * the caller's intent, below it only a family index (see CommandPoolHashTableKey).
      * No branches: a role without a family of its own was given the graphics one back at
      * device selection. */
-    Uint32 queueFamilyIndex =
-        (queueType == SDL_GPU_QUEUETYPE_TRANSFER)
-            ? renderer->transferQueueFamilyIndex
-            : renderer->queueFamilyIndex;
+    Uint32 queueFamilyIndex = renderer->queueFamilyIndices[queueType];
 
     SDL_LockMutex(renderer->acquireCommandBufferLock);
 
@@ -12364,7 +12368,12 @@ static Uint8 VULKAN_INTERNAL_IsDeviceSuitable(
     VulkanFeatures *features,
     VkPhysicalDevice physicalDevice,
     VulkanExtensions *physicalDeviceExtensions,
-    Uint32 *queueFamilyIndex)
+    Uint32 *queueFamilyIndex,
+    /* ENGINE-FORK: dedicated families for COMPUTE and TRANSFER. SDL_MAX_UINT32 means none
+     * was found, in which case the role falls back to graphics (filled in by the
+     * caller). */
+    Uint32 *computeQueueFamilyIndex,
+    Uint32 *transferQueueFamilyIndex)
 {
     Uint32 queueFamilyCount, queueFamilyRank, queueFamilyBest;
     VkQueueFamilyProperties *queueProps;
@@ -12469,6 +12478,45 @@ static Uint8 VULKAN_INTERNAL_IsDeviceSuitable(
         }
     }
 
+    /* ENGINE-FORK: DEDICATED families for compute and transfer.
+     *
+     * We look for strictly specialised ones rather than "any that fits": the point of a
+     * second queue is to get work onto a DIFFERENT hardware engine. A family with
+     * GRAPHICS_BIT is the same engine that renders, and offloading onto it would buy
+     * nothing but the illusion of parallelism.
+     *
+     *   compute  = COMPUTE but NOT GRAPHICS  (the ACEs on AMD)
+     *   transfer = TRANSFER but NOT GRAPHICS and NOT COMPUTE  (a dedicated DMA engine,
+     *              SDMA on AMD)
+     *
+     * About TRANSFER_BIT: the spec allows a graphics/compute family not to advertise it
+     * even though it can copy. That does not matter to us -- we are looking for the
+     * family that sets it EXPLICITLY and has nothing else, and such a family always
+     * advertises the bit.
+     *
+     * If none is found the value stays SDL_MAX_UINT32 and the caller substitutes
+     * graphics. */
+    *computeQueueFamilyIndex = SDL_MAX_UINT32;
+    *transferQueueFamilyIndex = SDL_MAX_UINT32;
+    for (i = 0; i < queueFamilyCount; i += 1) {
+        VkQueueFlags flags = queueProps[i].queueFlags;
+
+        if (queueProps[i].queueCount == 0) {
+            continue;
+        }
+        if (flags & VK_QUEUE_GRAPHICS_BIT) {
+            continue;   // same engine that renders -- not interesting
+        }
+
+        if ((flags & VK_QUEUE_COMPUTE_BIT) && *computeQueueFamilyIndex == SDL_MAX_UINT32) {
+            *computeQueueFamilyIndex = i;
+        } else if ((flags & VK_QUEUE_TRANSFER_BIT) &&
+                   !(flags & VK_QUEUE_COMPUTE_BIT) &&
+                   *transferQueueFamilyIndex == SDL_MAX_UINT32) {
+            *transferQueueFamilyIndex = i;
+        }
+    }
+
     SDL_stack_free(queueProps);
 
     if (*queueFamilyIndex == SDL_MAX_UINT32) {
@@ -12488,6 +12536,7 @@ static Uint8 VULKAN_INTERNAL_DeterminePhysicalDevice(VulkanRenderer *renderer, V
     Uint32 i, physicalDeviceCount;
     Sint32 suitableIndex;
     Uint32 suitableQueueFamilyIndex;
+    Uint32 suitableComputeQueueFamilyIndex, suitableTransferQueueFamilyIndex;   /* ENGINE-FORK */
     Uint64 highestRank;
 
     vulkanResult = renderer->vkEnumeratePhysicalDevices(
@@ -12533,8 +12582,12 @@ static Uint8 VULKAN_INTERNAL_DeterminePhysicalDevice(VulkanRenderer *renderer, V
     suitableIndex = -1;
     suitableQueueFamilyIndex = 0;
     highestRank = 0;
+    /* ENGINE-FORK: the specialised families of the chosen device (SDL_MAX_UINT32 = none) */
+    suitableComputeQueueFamilyIndex = SDL_MAX_UINT32;
+    suitableTransferQueueFamilyIndex = SDL_MAX_UINT32;
     for (i = 0; i < physicalDeviceCount; i += 1) {
         Uint32 queueFamilyIndex;
+        Uint32 computeQueueFamilyIndex, transferQueueFamilyIndex;   /* ENGINE-FORK */
         Uint64 deviceRank;
 
         if (!VULKAN_INTERNAL_IsDeviceSuitable(
@@ -12542,7 +12595,9 @@ static Uint8 VULKAN_INTERNAL_DeterminePhysicalDevice(VulkanRenderer *renderer, V
                 features,
                 physicalDevices[i],
                 &physicalDeviceExtensions[i],
-                &queueFamilyIndex)) {
+                &queueFamilyIndex,
+                &computeQueueFamilyIndex,
+                &transferQueueFamilyIndex)) {
             // Device does not meet the minimum requirements, skip it entirely
             continue;
         }
@@ -12559,6 +12614,10 @@ static Uint8 VULKAN_INTERNAL_DeterminePhysicalDevice(VulkanRenderer *renderer, V
              */
             suitableIndex = i;
             suitableQueueFamilyIndex = queueFamilyIndex;
+            /* ENGINE-FORK: the families belong to the DEVICE, so they are taken together with
+             * it -- otherwise a change of winner would leave indices from another card. */
+            suitableComputeQueueFamilyIndex = computeQueueFamilyIndex;
+            suitableTransferQueueFamilyIndex = transferQueueFamilyIndex;
             highestRank = deviceRank;
         }
     }
@@ -12567,9 +12626,32 @@ static Uint8 VULKAN_INTERNAL_DeterminePhysicalDevice(VulkanRenderer *renderer, V
         renderer->supports = physicalDeviceExtensions[suitableIndex];
         renderer->physicalDevice = physicalDevices[suitableIndex];
         renderer->queueFamilyIndex = suitableQueueFamilyIndex;
-        /* ENGINE-FORK: a dedicated copy family is not searched for yet -- fall back to the
-         * graphics one. This is the ONLY assignment the next step will change. */
-        renderer->transferQueueFamilyIndex = suitableQueueFamilyIndex;
+
+        /* ENGINE-FORK: THIS, AND ONLY THIS, is where it is decided what degrades into what.
+         * Everything below (role mapping, pool key, submission) then runs without a single
+         * "does that queue exist?" check.
+         *
+         * A role without its own family falls onto the NEAREST WIDER one, because the
+         * capabilities are nested: TRANSFER is a subset of COMPUTE is a subset of GRAPHICS.
+         * Falling is only possible UPWARDS through that nesting -- a compute family will
+         * perform copies (the spec implies transfer support for any graphics/compute
+         * family), whereas a transfer family will never perform a dispatch.
+         *
+         * Which matters for uploads: if there is no dedicated DMA family but there is a
+         * compute one, uploads go to compute and NOT to graphics. That is still a DIFFERENT
+         * hardware engine, so the overlap with rendering survives. The "compute yes,
+         * transfer no" configuration is common, and losing it would be a shame. */
+        renderer->queueFamilyIndices[SDL_GPU_QUEUETYPE_GRAPHICS] = suitableQueueFamilyIndex;
+        renderer->queueFamilyIndices[SDL_GPU_QUEUETYPE_COMPUTE] =
+            (suitableComputeQueueFamilyIndex != SDL_MAX_UINT32)
+                ? suitableComputeQueueFamilyIndex
+                : suitableQueueFamilyIndex;
+        /* The already-resolved COMPUTE entry is itself either a dedicated family or the
+         * graphics one, so this single expression covers both steps of the descent. */
+        renderer->queueFamilyIndices[SDL_GPU_QUEUETYPE_TRANSFER] =
+            (suitableTransferQueueFamilyIndex != SDL_MAX_UINT32)
+                ? suitableTransferQueueFamilyIndex
+                : renderer->queueFamilyIndices[SDL_GPU_QUEUETYPE_COMPUTE];
     } else {
         SDL_stack_free(physicalDevices);
         SDL_stack_free(physicalDeviceExtensions);
@@ -12616,16 +12698,35 @@ static Uint8 VULKAN_INTERNAL_CreateLogicalDevice(
     VkPhysicalDevicePortabilitySubsetFeaturesKHR portabilityFeatures;
     const char **deviceExtensions;
 
-    VkDeviceQueueCreateInfo queueCreateInfo;
+    /* ENGINE-FORK: one request per EVERY DISTINCT family. A family must not be listed twice
+     * (VUID-VkDeviceCreateInfo-queueFamilyIndex-02802), and under fallback the roles share
+     * one -- so the list is built by filtering out duplicates rather than one request per
+     * role. */
+    VkDeviceQueueCreateInfo queueCreateInfos[SDL_GPU_QUEUETYPE_COUNT];
+    Uint32 queueCreateInfoCount = 0;
+    Uint32 qi, qj;
     float queuePriority = 1.0f;
 
-    queueCreateInfo.sType =
-        VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
-    queueCreateInfo.pNext = NULL;
-    queueCreateInfo.flags = 0;
-    queueCreateInfo.queueFamilyIndex = renderer->queueFamilyIndex;
-    queueCreateInfo.queueCount = 1;
-    queueCreateInfo.pQueuePriorities = &queuePriority;
+    for (qi = 0; qi < SDL_GPU_QUEUETYPE_COUNT; qi += 1) {
+        bool alreadyRequested = false;
+        for (qj = 0; qj < queueCreateInfoCount; qj += 1) {
+            if (queueCreateInfos[qj].queueFamilyIndex == renderer->queueFamilyIndices[qi]) {
+                alreadyRequested = true;
+                break;
+            }
+        }
+        if (alreadyRequested) {
+            continue;
+        }
+
+        queueCreateInfos[queueCreateInfoCount].sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+        queueCreateInfos[queueCreateInfoCount].pNext = NULL;
+        queueCreateInfos[queueCreateInfoCount].flags = 0;
+        queueCreateInfos[queueCreateInfoCount].queueFamilyIndex = renderer->queueFamilyIndices[qi];
+        queueCreateInfos[queueCreateInfoCount].queueCount = 1;
+        queueCreateInfos[queueCreateInfoCount].pQueuePriorities = &queuePriority;
+        queueCreateInfoCount += 1;
+    }
 
     // check feature support
 
@@ -12671,8 +12772,8 @@ static Uint8 VULKAN_INTERNAL_CreateLogicalDevice(
         deviceCreateInfo.pNext = NULL;
     }
     deviceCreateInfo.flags = 0;
-    deviceCreateInfo.queueCreateInfoCount = 1;
-    deviceCreateInfo.pQueueCreateInfos = &queueCreateInfo;
+    deviceCreateInfo.queueCreateInfoCount = queueCreateInfoCount;   /* ENGINE-FORK */
+    deviceCreateInfo.pQueueCreateInfos = queueCreateInfos;
     deviceCreateInfo.enabledLayerCount = 0;
     deviceCreateInfo.ppEnabledLayerNames = NULL;
     deviceCreateInfo.enabledExtensionCount = GetDeviceExtensionCount(
@@ -12761,11 +12862,32 @@ static Uint8 VULKAN_INTERNAL_CreateLogicalDevice(
                              #func);
 #include "SDL_gpu_vulkan_vkfuncs.h"
 
-    renderer->vkGetDeviceQueue(
-        renderer->logicalDevice,
-        renderer->queueFamilyIndex,
-        0,
-        &renderer->unifiedQueue);
+    /* ENGINE-FORK: a queue handle per role. vkGetDeviceQueue creates nothing -- the queue
+     * belongs to the device and dies with it, so there is no matching destroy. Roles
+     * sharing a family (fallback) receive the same handle, and that is exactly what
+     * degrading to a single queue means. */
+    for (qi = 0; qi < SDL_GPU_QUEUETYPE_COUNT; qi += 1) {
+        renderer->vkGetDeviceQueue(
+            renderer->logicalDevice,
+            renderer->queueFamilyIndices[qi],
+            0,
+            &renderer->queues[qi]);
+    }
+    renderer->unifiedQueue = renderer->queues[SDL_GPU_QUEUETYPE_GRAPHICS];
+
+    if (renderer->debugMode) {
+        Uint32 gfx = renderer->queueFamilyIndices[SDL_GPU_QUEUETYPE_GRAPHICS];
+        Uint32 cmp = renderer->queueFamilyIndices[SDL_GPU_QUEUETYPE_COMPUTE];
+        Uint32 xfr = renderer->queueFamilyIndices[SDL_GPU_QUEUETYPE_TRANSFER];
+        SDL_LogInfo(SDL_LOG_CATEGORY_GPU,
+                    "GPU queue families: graphics=%u compute=%u%s transfer=%u%s (%u distinct)",
+                    gfx,
+                    cmp, (cmp == gfx) ? " (shared with graphics)" : " (dedicated)",
+                    xfr, (xfr == gfx) ? " (shared with graphics)"
+                       : (xfr == cmp) ? " (shared with compute)"
+                                      : " (dedicated)",
+                    queueCreateInfoCount);
+    }
 
     return 1;
 }
