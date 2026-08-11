@@ -1114,6 +1114,14 @@ struct VulkanCommandPool
     SDL_ThreadID threadID;
     VkCommandPool commandPool;
 
+    /* ENGINE-FORK: the pool's family and ITS queue -- every buffer from this pool is
+     * submitted there. Resolved once at pool creation because it cannot change
+     * afterwards: a command buffer is only valid for the family of the pool it came
+     * from. Submission therefore stops depending on the global renderer->unifiedQueue,
+     * and no longer has to ask anyone about roles. */
+    Uint32 queueFamilyIndex;
+    VkQueue queue;
+
     /* ENGINE-FORK: mask of usage bits expressible on this family's queue (see
      * VULKAN_BUFFER_USAGE_MODE_MASK_*). It lives on the pool rather than on the command
      * buffer because it is a property of the FAMILY: the pool is already created with a
@@ -9728,6 +9736,23 @@ static VulkanCommandPool *VULKAN_INTERNAL_FetchCommandPool(
     }
 
     vulkanCommandPool->threadID = threadID;
+
+    /* ENGINE-FORK: family -> queue. renderer->queues[] is indexed by ROLE while what we
+     * have here is a family, so we look up the first role using that family. The answer is
+     * unambiguous: roles sharing a family were handed the same handle (vkGetDeviceQueue
+     * with identical arguments). A miss is impossible -- the family came out of this very
+     * table. */
+    vulkanCommandPool->queueFamilyIndex = queueFamilyIndex;
+    vulkanCommandPool->queue = VK_NULL_HANDLE;
+    for (Uint32 role = 0; role < SDL_GPU_QUEUETYPE_COUNT; role += 1) {
+        if (renderer->queueFamilyIndices[role] == queueFamilyIndex) {
+            vulkanCommandPool->queue = renderer->queues[role];
+            break;
+        }
+    }
+    SDL_assert_release(vulkanCommandPool->queue != VK_NULL_HANDLE &&
+                       "Command pool family has no queue!");
+
     /* ENGINE-FORK: while there is a single queue and it is the graphics one, the mask lets
      * everything through and barrier emission does not change by a single bit. Once a
      * second (copy) family appears, its pools will pick up
@@ -11005,8 +11030,17 @@ static bool VULKAN_Submit(
     submitInfo.pSignalSemaphores = vulkanCommandBuffer->signalSemaphores;
     submitInfo.signalSemaphoreCount = vulkanCommandBuffer->signalSemaphoreCount;
 
+    /* ENGINE-FORK: submit to its OWN queue, not to the global one. A buffer is only valid
+     * for the family of its pool, so the queue is taken from there -- asking about roles
+     * at this level is neither necessary nor possible.
+     *
+     * submitLock stays a SINGLE lock across all queues, and that is not a leftover:
+     * vkQueueSubmit requires external synchronisation per queue, but the same lock also
+     * covers SHARED state -- the fence pool, the deferred-destroy lists, defragmentation.
+     * Those do not split per queue. The cost is small: vkQueueSubmit only enqueues work
+     * and returns; the parallelism lives on the GPU, not here. */
     vulkanResult = renderer->vkQueueSubmit(
-        renderer->unifiedQueue,
+        vulkanCommandBuffer->commandPool->queue,
         1,
         &submitInfo,
         vulkanCommandBuffer->inFlightFence->fence);
@@ -11030,8 +11064,18 @@ static bool VULKAN_Submit(
         presentInfo.pImageIndices = &presentData->swapchainImageIndex;
         presentInfo.pResults = NULL;
 
+        /* ENGINE-FORK: present ALWAYS goes on the graphics queue, not on this buffer's queue.
+         * The family used for presentation was chosen with an explicit
+         * SDL_Vulkan_GetPresentationSupport check -- the transfer and compute families do
+         * not have it, and presenting from them is invalid.
+         *
+         * Today this coincides with the buffer's own queue (presentData only appears for
+         * whoever requested the swapchain, and the swapchain is a graphics-role
+         * operation), but the coincidence must not be relied on: it is implicit, and
+         * breaking it would produce not a compile error but a crash on someone else's
+         * machine. */
         presentResult = renderer->vkQueuePresentKHR(
-            renderer->unifiedQueue,
+            renderer->queues[SDL_GPU_QUEUETYPE_GRAPHICS],
             &presentInfo);
 
         if (presentResult == VK_SUCCESS || presentResult == VK_SUBOPTIMAL_KHR || presentResult == VK_ERROR_OUT_OF_DATE_KHR) {
