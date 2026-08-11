@@ -2137,8 +2137,13 @@ static bool METAL_INTERNAL_AcquireFence(
 }
 
 static SDL_GPUCommandBuffer *METAL_AcquireCommandBuffer(
-    SDL_GPURenderer *driverData)
+    SDL_GPURenderer *driverData,
+    SDL_GPUQueueType queueType)
 {
+    /* ENGINE-FORK: Metal has a single MTLCommandQueue by design, so TRANSFER degrades
+     * onto it. This is the backend that makes the fallback a permanent, supported
+     * path rather than a temporary shim. */
+    (void)queueType;
     @autoreleasepool {
         MetalRenderer *renderer = (MetalRenderer *)driverData;
         MetalCommandBuffer *commandBuffer;

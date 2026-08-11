@@ -916,6 +916,13 @@ typedef struct RenderPassDepthStencilTargetDescription
 typedef struct CommandPoolHashTableKey
 {
     SDL_ThreadID threadID;
+    /* ENGINE-FORK: a Vulkan command pool is created FOR A QUEUE FAMILY and is only valid
+     * for that family, so with more than one family a threadID alone is no longer a
+     * sufficient key. The family appears here as an index, not as a "role": the role
+     * (upload/render) lives higher up, at the public API boundary, and whoever asks for
+     * the command buffer is the one who maps it to a family. The pool knows nothing
+     * about roles, and should not. */
+    Uint32 queueFamilyIndex;
 } CommandPoolHashTableKey;
 
 typedef struct RenderPassHashTableKey
@@ -1176,6 +1183,14 @@ struct VulkanRenderer
     Uint32 queueFamilyIndex;
     VkQueue unifiedQueue;
 
+    /* ENGINE-FORK: the family behind SDL_GPU_QUEUETYPE_TRANSFER. Until a dedicated one is
+     * set up it is EQUAL to queueFamilyIndex -- and that equality is precisely how the
+     * fallback works: mapping the role to a family (VULKAN_AcquireCommandBuffer) simply
+     * hands back the same family, and neither the pool key nor anything below it ever
+     * learns that there is no second queue. When a dedicated family does appear, one
+     * assignment at device creation changes; the rest of the code is already in place. */
+    Uint32 transferQueueFamilyIndex;
+
     VulkanCommandBuffer **submittedCommandBuffers;
     Uint32 submittedCommandBufferCount;
     Uint32 submittedCommandBufferCapacity;
@@ -1269,7 +1284,7 @@ static void VULKAN_ReleaseWindow(SDL_GPURenderer *driverData, SDL_Window *window
 static bool VULKAN_Wait(SDL_GPURenderer *driverData);
 static bool VULKAN_WaitForFences(SDL_GPURenderer *driverData, bool waitAll, SDL_GPUFence *const *fences, Uint32 numFences);
 static bool VULKAN_Submit(SDL_GPUCommandBuffer *commandBuffer);
-static SDL_GPUCommandBuffer *VULKAN_AcquireCommandBuffer(SDL_GPURenderer *driverData);
+static SDL_GPUCommandBuffer *VULKAN_AcquireCommandBuffer(SDL_GPURenderer *driverData, SDL_GPUQueueType queueType);
 
 // Error Handling
 
@@ -3585,14 +3600,18 @@ static void SDLCALL VULKAN_INTERNAL_DescriptorSetLayoutHashDestroy(void *userdat
 
 static Uint32 SDLCALL VULKAN_INTERNAL_CommandPoolHashFunction(void *userdata, const void *key)
 {
-    return (Uint32)((CommandPoolHashTableKey *)key)->threadID;
+    /* ENGINE-FORK: the family is mixed into the hash along with the thread. Families are
+     * few, and without mixing, pools of different families on the same thread would all
+     * land in one bucket. */
+    CommandPoolHashTableKey *k = (CommandPoolHashTableKey *)key;
+    return (Uint32)k->threadID ^ (k->queueFamilyIndex * 2654435761u);
 }
 
 static bool SDLCALL VULKAN_INTERNAL_CommandPoolHashKeyMatch(void *userdata, const void *aKey, const void *bKey)
 {
     CommandPoolHashTableKey *a = (CommandPoolHashTableKey *)aKey;
     CommandPoolHashTableKey *b = (CommandPoolHashTableKey *)bKey;
-    return a->threadID == b->threadID;
+    return a->threadID == b->threadID && a->queueFamilyIndex == b->queueFamilyIndex;
 }
 
 static void SDLCALL VULKAN_INTERNAL_CommandPoolHashDestroy(void *userdata, const void *key, const void *value)
@@ -7042,7 +7061,12 @@ static SDL_GPUTexture *VULKAN_CreateTexture(
     // Only do this after "container" is set, so the texture
     // is fully initialized before any Submit that could trigger defrag.
     {
-        VulkanCommandBuffer *barrierCommandBuffer = (VulkanCommandBuffer *)VULKAN_AcquireCommandBuffer((SDL_GPURenderer *)renderer);
+        /* ENGINE-FORK: GRAPHICS is mandatory here and not a choice -- this is a TEXTURE
+         * barrier (a layout transition), and those are forbidden outside the graphics
+         * queue (see the comment on VULKAN_INTERNAL_TextureMemoryBarrier). SDL acquires
+         * the buffer itself, bypassing the public API, so the engine-side types do not
+         * cover this site -- only naming the role explicitly here does. */
+        VulkanCommandBuffer *barrierCommandBuffer = (VulkanCommandBuffer *)VULKAN_AcquireCommandBuffer((SDL_GPURenderer *)renderer, SDL_GPU_QUEUETYPE_GRAPHICS);
         VULKAN_INTERNAL_TextureTransitionToDefaultUsage(
             renderer,
             barrierCommandBuffer,
@@ -9655,13 +9679,15 @@ static bool VULKAN_INTERNAL_AllocateCommandBuffer(
 
 static VulkanCommandPool *VULKAN_INTERNAL_FetchCommandPool(
     VulkanRenderer *renderer,
-    SDL_ThreadID threadID)
+    SDL_ThreadID threadID,
+    Uint32 queueFamilyIndex)   /* ENGINE-FORK: pools are now per-(thread, family), not per-thread */
 {
     VulkanCommandPool *vulkanCommandPool = NULL;
     VkCommandPoolCreateInfo commandPoolCreateInfo;
     VkResult vulkanResult;
     CommandPoolHashTableKey key;
     key.threadID = threadID;
+    key.queueFamilyIndex = queueFamilyIndex;
 
     bool result = SDL_FindInHashTable(
         renderer->commandPoolHashTable,
@@ -9677,7 +9703,10 @@ static VulkanCommandPool *VULKAN_INTERNAL_FetchCommandPool(
     commandPoolCreateInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
     commandPoolCreateInfo.pNext = NULL;
     commandPoolCreateInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-    commandPoolCreateInfo.queueFamilyIndex = renderer->queueFamilyIndex;
+    /* ENGINE-FORK: the family comes from the key, not from the global
+     * renderer->queueFamilyIndex -- otherwise a pool requested for the second family
+     * would be created for the first. */
+    commandPoolCreateInfo.queueFamilyIndex = queueFamilyIndex;
 
     vulkanResult = renderer->vkCreateCommandPool(
         renderer->logicalDevice,
@@ -9711,6 +9740,7 @@ static VulkanCommandPool *VULKAN_INTERNAL_FetchCommandPool(
 
     CommandPoolHashTableKey *allocedKey = SDL_malloc(sizeof(CommandPoolHashTableKey));
     allocedKey->threadID = threadID;
+    allocedKey->queueFamilyIndex = queueFamilyIndex;   /* ENGINE-FORK */
 
     SDL_InsertIntoHashTable(
         renderer->commandPoolHashTable,
@@ -9722,10 +9752,11 @@ static VulkanCommandPool *VULKAN_INTERNAL_FetchCommandPool(
 
 static VulkanCommandBuffer *VULKAN_INTERNAL_GetInactiveCommandBufferFromPool(
     VulkanRenderer *renderer,
-    SDL_ThreadID threadID)
+    SDL_ThreadID threadID,
+    Uint32 queueFamilyIndex)   /* ENGINE-FORK: carries the family through to the pool */
 {
     VulkanCommandPool *commandPool =
-        VULKAN_INTERNAL_FetchCommandPool(renderer, threadID);
+        VULKAN_INTERNAL_FetchCommandPool(renderer, threadID, queueFamilyIndex);
     VulkanCommandBuffer *commandBuffer;
 
     if (commandPool == NULL) {
@@ -9747,7 +9778,8 @@ static VulkanCommandBuffer *VULKAN_INTERNAL_GetInactiveCommandBufferFromPool(
 }
 
 static SDL_GPUCommandBuffer *VULKAN_AcquireCommandBuffer(
-    SDL_GPURenderer *driverData)
+    SDL_GPURenderer *driverData,
+    SDL_GPUQueueType queueType)
 {
     VulkanRenderer *renderer = (VulkanRenderer *)driverData;
     VkResult result;
@@ -9755,10 +9787,19 @@ static SDL_GPUCommandBuffer *VULKAN_AcquireCommandBuffer(
 
     SDL_ThreadID threadID = SDL_GetCurrentThreadID();
 
+    /* ENGINE-FORK: ROLE -> FAMILY. The single place this mapping happens: above it lives
+     * the caller's intent, below it only a family index (see CommandPoolHashTableKey).
+     * No branches: a role without a family of its own was given the graphics one back at
+     * device selection. */
+    Uint32 queueFamilyIndex =
+        (queueType == SDL_GPU_QUEUETYPE_TRANSFER)
+            ? renderer->transferQueueFamilyIndex
+            : renderer->queueFamilyIndex;
+
     SDL_LockMutex(renderer->acquireCommandBufferLock);
 
     VulkanCommandBuffer *commandBuffer =
-        VULKAN_INTERNAL_GetInactiveCommandBufferFromPool(renderer, threadID);
+        VULKAN_INTERNAL_GetInactiveCommandBufferFromPool(renderer, threadID, queueFamilyIndex);
 
     if (commandBuffer == NULL) {
         SDL_UnlockMutex(renderer->acquireCommandBufferLock);
@@ -12526,6 +12567,9 @@ static Uint8 VULKAN_INTERNAL_DeterminePhysicalDevice(VulkanRenderer *renderer, V
         renderer->supports = physicalDeviceExtensions[suitableIndex];
         renderer->physicalDevice = physicalDevices[suitableIndex];
         renderer->queueFamilyIndex = suitableQueueFamilyIndex;
+        /* ENGINE-FORK: a dedicated copy family is not searched for yet -- fall back to the
+         * graphics one. This is the ONLY assignment the next step will change. */
+        renderer->transferQueueFamilyIndex = suitableQueueFamilyIndex;
     } else {
         SDL_stack_free(physicalDevices);
         SDL_stack_free(physicalDeviceExtensions);

@@ -1640,8 +1640,18 @@ void SDL_ReleaseGPUGraphicsPipeline(
 
 // Command Buffer
 
+/* ENGINE-FORK: the original form is kept as a wrapper over the queue-aware one. That
+ * leaves every existing consumer of SDL_gpu.h (ImGui among others) completely
+ * untouched, and keeps the whole fork diff additive. */
 SDL_GPUCommandBuffer *SDL_AcquireGPUCommandBuffer(
     SDL_GPUDevice *device)
+{
+    return SDL_AcquireGPUCommandBufferOnQueue(device, SDL_GPU_QUEUETYPE_GRAPHICS);
+}
+
+SDL_GPUCommandBuffer *SDL_AcquireGPUCommandBufferOnQueue(
+    SDL_GPUDevice *device,
+    SDL_GPUQueueType queue_type)
 {
     SDL_GPUCommandBuffer *command_buffer;
     CommandBufferCommonHeader *commandBufferHeader;
@@ -1649,7 +1659,8 @@ SDL_GPUCommandBuffer *SDL_AcquireGPUCommandBuffer(
     CHECK_DEVICE_MAGIC(device, NULL);
 
     command_buffer = device->AcquireCommandBuffer(
-        device->driverData);
+        device->driverData,
+        queue_type);
 
     if (command_buffer == NULL) {
         return NULL;

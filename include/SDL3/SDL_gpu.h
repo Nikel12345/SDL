@@ -547,6 +547,31 @@ typedef struct SDL_GPUGraphicsPipeline SDL_GPUGraphicsPipeline;
 typedef struct SDL_GPUCommandBuffer SDL_GPUCommandBuffer;
 
 /**
+ * ENGINE-FORK: which queue a command buffer will be submitted to.
+ *
+ * Named by CAPABILITY, not by intended use: the distinction that matters to
+ * the implementation is what the queue can execute, not what the caller plans
+ * to do with it. Roles like "upload" or "render" belong in the caller's own
+ * abstraction, which maps them onto these.
+ *
+ * If the device has no separate transfer queue -- and today none of the
+ * backends do -- every value resolves to the same queue and behaviour is
+ * unchanged. This fallback is permanent, not provisional: Metal has a single
+ * command queue by design, and plenty of hardware exposes no transfer-only
+ * queue family.
+ *
+ * Note that the "command buffers are executed in submission order" guarantee
+ * documented on SDL_GPUCommandBuffer holds only WITHIN one queue. Work
+ * recorded on TRANSFER and work recorded on GRAPHICS are ordered against each
+ * other only by whatever the caller arranges (a fence, typically).
+ */
+typedef enum SDL_GPUQueueType
+{
+    SDL_GPU_QUEUETYPE_GRAPHICS,  /**< Everything: render, compute and copy passes, mipmaps, blits, swapchain. */
+    SDL_GPU_QUEUETYPE_TRANSFER   /**< Copies only. Falls back to the graphics queue when unavailable. */
+} SDL_GPUQueueType;
+
+/**
  * An opaque handle representing a render pass.
  *
  * This handle is transient and should not be held or referenced after
@@ -3163,6 +3188,35 @@ extern SDL_DECLSPEC void SDLCALL SDL_ReleaseGPUGraphicsPipeline(
  */
 extern SDL_DECLSPEC SDL_GPUCommandBuffer * SDLCALL SDL_AcquireGPUCommandBuffer(
     SDL_GPUDevice *device);
+
+/**
+ * ENGINE-FORK: acquire a command buffer bound to a particular queue.
+ *
+ * Identical to SDL_AcquireGPUCommandBuffer in every respect except that the
+ * caller chooses which queue the buffer will be submitted to.
+ * SDL_AcquireGPUCommandBuffer is exactly this function with
+ * SDL_GPU_QUEUETYPE_GRAPHICS.
+ *
+ * Requesting SDL_GPU_QUEUETYPE_TRANSFER on a device without a separate
+ * transfer queue is not an error: it silently yields a graphics command
+ * buffer. Callers therefore never need to branch on availability -- the same
+ * code is correct either way, and only the amount of overlap changes.
+ *
+ * A transfer command buffer accepts copy passes only. Render passes, compute
+ * passes, mipmap generation, blits and swapchain acquisition have no meaning
+ * on a copy queue and must not be recorded onto one.
+ *
+ * \param device a GPU context.
+ * \param queue_type which queue the command buffer will be submitted to.
+ * \returns a command buffer, or NULL on failure; call SDL_GetError() for more
+ *          information.
+ *
+ * \sa SDL_AcquireGPUCommandBuffer
+ * \sa SDL_SubmitGPUCommandBuffer
+ */
+extern SDL_DECLSPEC SDL_GPUCommandBuffer * SDLCALL SDL_AcquireGPUCommandBufferOnQueue(
+    SDL_GPUDevice *device,
+    SDL_GPUQueueType queue_type);
 
 /* Uniform Data */
 
