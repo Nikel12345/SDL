@@ -50,6 +50,10 @@ SDL_DYNAPI_PROC(int,SDL_swprintf,(SDL_OUT_Z_CAP(b) wchar_t *a, size_t b, SDL_PRI
 /* New API symbols are added at the end */
 SDL_DYNAPI_PROC(SDL_Surface*,SDL_AcquireCameraFrame,(SDL_Camera *a, Uint64 *b),(a,b),return)
 SDL_DYNAPI_PROC(SDL_GPUCommandBuffer*,SDL_AcquireGPUCommandBuffer,(SDL_GPUDevice *a),(a),return)
+/* ENGINE-FORK: without an entry here the function never makes it into the dynapi
+ * jump table and is not exported from SDL3.dll -- linking then fails on an
+ * unresolved symbol. Every new public function the fork adds belongs here too. */
+SDL_DYNAPI_PROC(SDL_GPUCommandBuffer*,SDL_AcquireGPUCommandBufferOnQueue,(SDL_GPUDevice *a, SDL_GPUQueueType b),(a,b),return)
 SDL_DYNAPI_PROC(bool,SDL_AcquireGPUSwapchainTexture,(SDL_GPUCommandBuffer *a, SDL_Window *b, SDL_GPUTexture **c, Uint32 *d, Uint32 *e),(a,b,c,d,e),return)
 SDL_DYNAPI_PROC(int,SDL_AddAtomicInt,(SDL_AtomicInt *a, int b),(a,b),return)
 SDL_DYNAPI_PROC(bool,SDL_AddEventWatch,(SDL_EventFilter a, void *b),(a,b),return)

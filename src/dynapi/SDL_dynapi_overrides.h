@@ -29,6 +29,7 @@
 // New API symbols are added at the end
 #define SDL_AcquireCameraFrame SDL_AcquireCameraFrame_REAL
 #define SDL_AcquireGPUCommandBuffer SDL_AcquireGPUCommandBuffer_REAL
+#define SDL_AcquireGPUCommandBufferOnQueue SDL_AcquireGPUCommandBufferOnQueue_REAL /* ENGINE-FORK */
 #define SDL_AcquireGPUSwapchainTexture SDL_AcquireGPUSwapchainTexture_REAL
 #define SDL_AddAtomicInt SDL_AddAtomicInt_REAL
 #define SDL_AddEventWatch SDL_AddEventWatch_REAL

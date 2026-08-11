@@ -1226,6 +1226,13 @@ struct VulkanRenderer
      * an error. The mask describes the hardware, not the intent. */
     VulkanBufferUsageModeFlags queueUsageModeMasks[SDL_GPU_QUEUETYPE_COUNT];
 
+    /* ENGINE-FORK: bitmask of families already reported as submitted to (debugMode).
+     * The FIRST submit into each family is logged: without it the routing is not
+     * observable from outside at all -- SDL hides the queue behind the command buffer --
+     * while printing every submit would bury the log under 60 lines a second. Held under
+     * submitLock, hence no atomics. */
+    Uint32 submitLoggedFamilies;
+
     VulkanCommandBuffer **submittedCommandBuffers;
     Uint32 submittedCommandBufferCount;
     Uint32 submittedCommandBufferCapacity;
@@ -11132,6 +11139,16 @@ static bool VULKAN_Submit(
      * covers SHARED state -- the fence pool, the deferred-destroy lists, defragmentation.
      * Those do not split per queue. The cost is small: vkQueueSubmit only enqueues work
      * and returns; the parallelism lives on the GPU, not here. */
+    if (renderer->debugMode) {
+        Uint32 fam = vulkanCommandBuffer->commandPool->queueFamilyIndex;
+        if (fam < 32 && !(renderer->submitLoggedFamilies & (1u << fam))) {
+            renderer->submitLoggedFamilies |= (1u << fam);
+            SDL_LogInfo(SDL_LOG_CATEGORY_GPU,
+                        "GPU first submit to queue family %u (thread %" SDL_PRIu64 ")",
+                        fam, (Uint64)vulkanCommandBuffer->commandPool->threadID);
+        }
+    }
+
     vulkanResult = renderer->vkQueueSubmit(
         vulkanCommandBuffer->commandPool->queue,
         1,
