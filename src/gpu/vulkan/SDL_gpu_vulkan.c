@@ -1206,6 +1206,13 @@ struct VulkanRenderer
     Uint32  queueFamilyIndices[SDL_GPU_QUEUETYPE_COUNT];
     VkQueue queues[SDL_GPU_QUEUETYPE_COUNT];
 
+    /* ENGINE-FORK: the same families, deduplicated. Needed where what matters is the SET
+     * rather than the role: queue creation requests and resource sharingMode. count == 1
+     * means everything collapsed onto one family, and then resources must stay EXCLUSIVE
+     * (CONCURRENT requires at least two). */
+    Uint32 distinctQueueFamilyIndices[SDL_GPU_QUEUETYPE_COUNT];
+    Uint32 distinctQueueFamilyCount;
+
     VulkanCommandBuffer **submittedCommandBuffers;
     Uint32 submittedCommandBufferCount;
     Uint32 submittedCommandBufferCapacity;
@@ -4372,9 +4379,33 @@ static VulkanBuffer *VULKAN_INTERNAL_CreateBuffer(
     createinfo.flags = 0;
     createinfo.size = size;
     createinfo.usage = vulkanUsageFlags;
-    createinfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    createinfo.queueFamilyIndexCount = 1;
-    createinfo.pQueueFamilyIndices = &renderer->queueFamilyIndex;
+    /* ENGINE-FORK: buffers are shared between families WITHOUT ownership transfer.
+     *
+     * EXCLUSIVE means "at any moment the resource belongs to exactly one family", and
+     * touching it from another without a paired release/acquire barrier yields UNDEFINED
+     * contents -- even under perfect separation in time, because a fence gives ordering
+     * and visibility but does NOT transfer ownership.
+     *
+     * CONCURRENT was chosen over ownership barriers for three reasons:
+     *   - a buffer has neither layout nor compression, so there is nothing to give up:
+     *     the cost is essentially nil (for TEXTURES it would be different, where
+     *     CONCURRENT can cost hardware compression);
+     *   - for a CONCURRENT resource VK_QUEUE_FAMILY_IGNORED is the CORRECT value in
+     *     barriers, so all the existing barrier code stays valid as written;
+     *   - ownership barriers would require REMEMBERING which family currently owns a
+     *     resource, and SDL remembers nothing about resource state -- its whole barrier
+     *     scheme rests on that.
+     *
+     * One family (fallback) -> EXCLUSIVE is mandatory: CONCURRENT requires at least two. */
+    if (renderer->distinctQueueFamilyCount > 1) {
+        createinfo.sharingMode = VK_SHARING_MODE_CONCURRENT;
+        createinfo.queueFamilyIndexCount = renderer->distinctQueueFamilyCount;
+        createinfo.pQueueFamilyIndices = renderer->distinctQueueFamilyIndices;
+    } else {
+        createinfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        createinfo.queueFamilyIndexCount = 1;
+        createinfo.pQueueFamilyIndices = &renderer->queueFamilyIndex;
+    }
 
     // Set transfer bits so we can defrag
     createinfo.usage |= VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
@@ -5908,6 +5939,24 @@ static VulkanTexture *VULKAN_INTERNAL_CreateTexture(
     imageCreateInfo.samples = SDLToVK_SampleCount[createinfo->sample_count];
     imageCreateInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
     imageCreateInfo.usage = vkUsageFlags;
+    /* ENGINE-FORK: textures DELIBERATELY stay EXCLUSIVE, unlike buffers.
+     *
+     * Here CONCURRENT is expensive: an image has a layout and compression metadata, and a
+     * form valid for every listed family usually means hardware compression is off -- a
+     * cost paid EVERY frame, even if the second family never touches the texture at all.
+     *
+     * For now this is safe: all of the engine's texture work lives on the graphics lane
+     * (mipmaps and blits necessarily so -- they are draws), so textures never cross
+     * families.
+     *
+     * WHEN TO CHANGE THIS: as soon as compute work on textures moves to the compute
+     * queue. The rule then follows straight from the creation flags, with nothing to
+     * remember:
+     *     usage contains COMPUTE_STORAGE_*  ->  CONCURRENT { graphics, compute }
+     *     otherwise                         ->  EXCLUSIVE
+     * And the cost there turns out to be small: a texture written by compute has to be
+     * storage, and SDL already keeps those in VK_IMAGE_LAYOUT_GENERAL, where the optimal
+     * compressed forms are gone anyway. */
     imageCreateInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     imageCreateInfo.queueFamilyIndexCount = 0;
     imageCreateInfo.pQueueFamilyIndices = NULL;
@@ -12696,6 +12745,26 @@ static Uint8 VULKAN_INTERNAL_DeterminePhysicalDevice(VulkanRenderer *renderer, V
             (suitableTransferQueueFamilyIndex != SDL_MAX_UINT32)
                 ? suitableTransferQueueFamilyIndex
                 : renderer->queueFamilyIndices[SDL_GPU_QUEUETYPE_COMPUTE];
+
+        /* ENGINE-FORK: the list of DISTINCT families -- computed once here and used twice: for
+         * the queue creation requests (a family must not be listed twice in
+         * pQueueCreateInfos) and for resource sharingMode. Under fallback the roles share a
+         * family and the list collapses. */
+        renderer->distinctQueueFamilyCount = 0;
+        for (Uint32 role = 0; role < SDL_GPU_QUEUETYPE_COUNT; role += 1) {
+            bool seen = false;
+            for (Uint32 d = 0; d < renderer->distinctQueueFamilyCount; d += 1) {
+                if (renderer->distinctQueueFamilyIndices[d] == renderer->queueFamilyIndices[role]) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (!seen) {
+                renderer->distinctQueueFamilyIndices[renderer->distinctQueueFamilyCount] =
+                    renderer->queueFamilyIndices[role];
+                renderer->distinctQueueFamilyCount += 1;
+            }
+        }
     } else {
         SDL_stack_free(physicalDevices);
         SDL_stack_free(physicalDeviceExtensions);
@@ -12742,34 +12811,21 @@ static Uint8 VULKAN_INTERNAL_CreateLogicalDevice(
     VkPhysicalDevicePortabilitySubsetFeaturesKHR portabilityFeatures;
     const char **deviceExtensions;
 
-    /* ENGINE-FORK: one request per EVERY DISTINCT family. A family must not be listed twice
+    /* ENGINE-FORK: one request per DISTINCT family -- a family must not be listed twice
      * (VUID-VkDeviceCreateInfo-queueFamilyIndex-02802), and under fallback the roles share
-     * one -- so the list is built by filtering out duplicates rather than one request per
-     * role. */
+     * one. The set was already computed during device selection. */
     VkDeviceQueueCreateInfo queueCreateInfos[SDL_GPU_QUEUETYPE_COUNT];
-    Uint32 queueCreateInfoCount = 0;
-    Uint32 qi, qj;
+    Uint32 queueCreateInfoCount = renderer->distinctQueueFamilyCount;
+    Uint32 qi;
     float queuePriority = 1.0f;
 
-    for (qi = 0; qi < SDL_GPU_QUEUETYPE_COUNT; qi += 1) {
-        bool alreadyRequested = false;
-        for (qj = 0; qj < queueCreateInfoCount; qj += 1) {
-            if (queueCreateInfos[qj].queueFamilyIndex == renderer->queueFamilyIndices[qi]) {
-                alreadyRequested = true;
-                break;
-            }
-        }
-        if (alreadyRequested) {
-            continue;
-        }
-
-        queueCreateInfos[queueCreateInfoCount].sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
-        queueCreateInfos[queueCreateInfoCount].pNext = NULL;
-        queueCreateInfos[queueCreateInfoCount].flags = 0;
-        queueCreateInfos[queueCreateInfoCount].queueFamilyIndex = renderer->queueFamilyIndices[qi];
-        queueCreateInfos[queueCreateInfoCount].queueCount = 1;
-        queueCreateInfos[queueCreateInfoCount].pQueuePriorities = &queuePriority;
-        queueCreateInfoCount += 1;
+    for (qi = 0; qi < queueCreateInfoCount; qi += 1) {
+        queueCreateInfos[qi].sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+        queueCreateInfos[qi].pNext = NULL;
+        queueCreateInfos[qi].flags = 0;
+        queueCreateInfos[qi].queueFamilyIndex = renderer->distinctQueueFamilyIndices[qi];
+        queueCreateInfos[qi].queueCount = 1;
+        queueCreateInfos[qi].pQueuePriorities = &queuePriority;
     }
 
     // check feature support
