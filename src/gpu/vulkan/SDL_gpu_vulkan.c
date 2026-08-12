@@ -7180,12 +7180,34 @@ static SDL_GPUTexture *VULKAN_CreateTexture(
     // Only do this after "container" is set, so the texture
     // is fully initialized before any Submit that could trigger defrag.
     {
-        /* ENGINE-FORK: GRAPHICS is mandatory here and not a choice -- this is a TEXTURE
-         * barrier (a layout transition), and those are forbidden outside the graphics
-         * queue (see the comment on VULKAN_INTERNAL_TextureMemoryBarrier). SDL acquires
-         * the buffer itself, bypassing the public API, so the engine-side types do not
-         * cover this site -- only naming the role explicitly here does. */
-        VulkanCommandBuffer *barrierCommandBuffer = (VulkanCommandBuffer *)VULKAN_AcquireCommandBuffer((SDL_GPURenderer *)renderer, SDL_GPU_QUEUETYPE_GRAPHICS);
+        /* ENGINE-FORK: the barrier goes on the family that owns the texture's DEFAULT state,
+         * rather than unconditionally on graphics. Which family that is follows from the very
+         * rule the barrier itself asserts on: a texture whose usage is only COMPUTE_STORAGE_*
+         * is expressible on the compute queue, while everything else (SAMPLER, graphics
+         * storage, render targets) is graphics-only.
+         *
+         * Why: textures are EXCLUSIVE and the fork performs no ownership transfer at all (every
+         * barrier uses VK_QUEUE_FAMILY_IGNORED). A texture created on graphics and then used
+         * from compute crosses a family boundary, after which its contents are undefined.
+         * Creating it on the family it will actually live on removes that crossing. It also
+         * removes a cross-queue ordering assumption: the creation barrier and the first use end
+         * up on the same queue, so the ordering comes from the queue rather than from luck.
+         *
+         * This does NOT cover SAMPLER + COMPUTE_STORAGE_* together: the default state of such a
+         * texture is SAMPLER (first in DefaultTextureUsageMode), so it is created on graphics
+         * and compute will still reach for it. That case can only be fixed by sharingMode --
+         * see the comment in VULKAN_INTERNAL_CreateTexture.
+         *
+         * SDL acquires this command buffer itself, bypassing the public API, so the engine-side
+         * command buffer types do not cover this site -- naming the role here is what does. */
+        VulkanTextureUsageMode defaultMode = VULKAN_INTERNAL_DefaultTextureUsageMode(texture);
+        SDL_GPUQueueType barrierQueueType =
+            (defaultMode == VULKAN_TEXTURE_USAGE_MODE_COMPUTE_STORAGE_READ ||
+             defaultMode == VULKAN_TEXTURE_USAGE_MODE_COMPUTE_STORAGE_READ_WRITE)
+                ? SDL_GPU_QUEUETYPE_COMPUTE
+                : SDL_GPU_QUEUETYPE_GRAPHICS;
+
+        VulkanCommandBuffer *barrierCommandBuffer = (VulkanCommandBuffer *)VULKAN_AcquireCommandBuffer((SDL_GPURenderer *)renderer, barrierQueueType);
         VULKAN_INTERNAL_TextureTransitionToDefaultUsage(
             renderer,
             barrierCommandBuffer,
