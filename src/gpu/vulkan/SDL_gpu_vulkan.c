@@ -7193,10 +7193,12 @@ static SDL_GPUTexture *VULKAN_CreateTexture(
          * removes a cross-queue ordering assumption: the creation barrier and the first use end
          * up on the same queue, so the ordering comes from the queue rather than from luck.
          *
-         * This does NOT cover SAMPLER + COMPUTE_STORAGE_* together: the default state of such a
-         * texture is SAMPLER (first in DefaultTextureUsageMode), so it is created on graphics
-         * and compute will still reach for it. That case can only be fixed by sharingMode --
-         * see the comment in VULKAN_INTERNAL_CreateTexture.
+         * A texture carrying SAMPLER on top of COMPUTE_STORAGE_* is pinned to graphics by this
+         * same rule: its default state is SAMPLER (first in DefaultTextureUsageMode), so it is
+         * created here and cannot be touched from compute at all -- the barrier asserts on the
+         * SOURCE state too, so the attempt aborts before anything is recorded. Sharing such a
+         * texture between families would need sharingMode, which stays EXCLUSIVE for every
+         * texture -- see the comment in VULKAN_INTERNAL_CreateTexture.
          *
          * SDL acquires this command buffer itself, bypassing the public API, so the engine-side
          * command buffer types do not cover this site -- naming the role here is what does. */

@@ -64,39 +64,54 @@ one contract change a caller has to absorb.
 
 This is the part worth reading before drawing conclusions from the diff size.
 
-**The second queue carries buffers only.** No texture data goes through it. `VULKAN_UploadToTexture`
-ends by transitioning the texture back to its default state, and for a sampler texture that state
-is not expressible outside the graphics queue, so the barrier assert fires. The copy itself would
-be legal anywhere; it is the return to the default state that is not. Only a texture whose sole
-usage is `COMPUTE_STORAGE_*` can be uploaded off the graphics queue, and nothing does that today.
+**Textures are `EXCLUSIVE`, and their usage flags decide which family they belong to.** A texture
+carrying a shader-facing flag — `SAMPLER`, graphics storage, or a render target — belongs to the
+graphics queue, because its default state is expressible only there. A texture with compute
+storage and nothing else belongs to the compute queue. Each is created on its own family: the
+initial layout transition is recorded there rather than unconditionally on graphics.
 
-**Textures are `EXCLUSIVE`, each bound to one family.** Which family follows from the usage flags,
-via expressibility of the default state: `SAMPLER`, graphics storage and render targets are
-graphics-only, while a compute-storage-only texture is also expressible on compute. There is no
-ownership transfer anywhere in the branch — every barrier uses `VK_QUEUE_FAMILY_IGNORED` — so a
-texture has to stay in one family for its whole life.
+Moving a texture between families is not an error, and it is not undefined *behaviour*. Under
+`VK_SHARING_MODE_EXCLUSIVE` with no ownership transfer — and there is none anywhere in this
+branch, every barrier uses `VK_QUEUE_FAMILY_IGNORED` — the spec says the resource *contents*
+become undefined for the receiving family. The program stays valid and validation stays silent;
+what can be lost is the data.
 
-One case still violates that: a texture carrying **both** `SAMPLER` and `COMPUTE_STORAGE_*`
-defaults to `SAMPLER`, is therefore created on graphics, and compute reaches for it anyway.
-Fixing it means `VK_SHARING_MODE_CONCURRENT` for exactly those textures. The rule is written down
-at the creation site but deliberately not implemented — `CONCURRENT` on an image usually costs
-hardware compression, every frame, even when the second family never touches it.
+For a graphics-pinned texture the move cannot even be attempted: the barrier asserts on the source
+state as well as on the destination, so the first touch from compute aborts. For a compute-storage
+texture the move to graphics is silent, and in practice harmless — both sides sit in
+`VK_IMAGE_LAYOUT_GENERAL`, where there is no compression state to lose, and the first crossing
+after creation carries no data at all, the creation barrier having only moved a fresh image out of
+`UNDEFINED`. The case to avoid is a texture that ping-pongs with live data between two families.
+Nothing detects it, and cross-queue ordering needs a fence regardless.
 
-Buffers do not have that problem and are created `CONCURRENT` whenever more than one distinct
-family exists: a buffer has neither layout nor compression, so sharing is essentially free, and
-`VK_QUEUE_FAMILY_IGNORED` is then the correct value in barriers, which leaves the existing barrier
-code valid as written.
+`VK_SHARING_MODE_CONCURRENT` is what would make sharing a texture legitimate, and no texture uses
+it: on an image `CONCURRENT` usually costs hardware compression, every frame, even when the second
+family never touches it. Buffers are the opposite case and are created `CONCURRENT` whenever more
+than one distinct family exists — a buffer has neither layout nor compression, so sharing is
+essentially free, and `VK_QUEUE_FAMILY_IGNORED` is then the correct value in barriers, which
+leaves the existing barrier code valid as written.
 
-**Mipmap generation and blits stay on graphics.** They are draws. Nothing in SDL routes them —
-what stops them is the texture barrier assert, plus whatever type discipline the caller has.
+**No texture data crosses the second queue.** `VULKAN_UploadToTexture` ends by transitioning the
+texture back to its default state, and for a graphics-pinned texture that state is not expressible
+off the graphics queue, so the barrier assert fires. The copy itself would be legal on any queue;
+it is the return to the default state that is not. A compute-storage texture could be uploaded on
+the compute queue, and nothing does that today — so in practice the second queue carries buffer
+data and, at most, the creation barrier of a compute-storage texture.
+
+**Mipmap generation and blits stay on graphics**, and that is the same rule rather than a separate
+one: SDL requires both `SAMPLER` and `COLOR_TARGET` usage to generate mipmaps, so any texture that
+can have them is graphics-pinned to begin with. Blits are draws for the same reason. Nothing routes
+them explicitly — the flags and the barrier assert do it.
 
 **`submitLock` is a single lock across all queues.** `vkQueueSubmit` needs external synchronisation
 per queue, but the same lock also covers the fence pool, the deferred-destroy lists and
 defragmentation, none of which split per queue. Submits therefore serialise on the CPU; the
 parallelism is on the GPU.
 
-**Compute-storage textures are not exercised at all**, so the compute lane has been used for
-dispatch and buffers only.
+**Compute-storage textures are not exercised at all.** No such texture exists in the caller's code
+yet, so the compute lane has carried dispatch and buffers only, and everything said above about
+where those textures are created and what happens if they cross is reasoned from the rules rather
+than observed in a run.
 
 **D3D12 and Metal received the parameter and nothing else.** No second queue exists there and none
 is planned in this branch.
