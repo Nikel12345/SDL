@@ -10260,6 +10260,16 @@ static bool VULKAN_ClaimWindow(
         }
 
         Uint32 createSwapchainResult = VULKAN_INTERNAL_CreateSwapchain(renderer, windowData);
+        /* ENGINE-FORK: a zero surface extent (a window created minimized, e.g. when the process was
+         * launched with SW_SHOWMINIMIZED) must still register the window. The upstream TRY_AGAIN
+         * branch below, now unreachable, returns true without storing windowData, so every later
+         * call treats the window as unclaimed and nothing ever retries. Registered with
+         * needsSwapchainRecreate, the window is handled like one minimized at runtime: acquire
+         * yields a NULL texture until it is restored. */
+        if (createSwapchainResult == VULKAN_INTERNAL_TRY_AGAIN) {
+            windowData->needsSwapchainRecreate = true;
+            createSwapchainResult = 1;
+        }
         if (createSwapchainResult == 1) {
             SDL_SetPointerProperty(SDL_GetWindowProperties(window), WINDOW_PROPERTY_DATA, windowData);
 
