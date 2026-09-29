@@ -12774,10 +12774,38 @@ static Uint8 VULKAN_INTERNAL_DeterminePhysicalDevice(VulkanRenderer *renderer, V
     /* ENGINE-FORK: the specialised families of the chosen device (SDL_MAX_UINT32 = none) */
     suitableComputeQueueFamilyIndex = SDL_MAX_UINT32;
     suitableTransferQueueFamilyIndex = SDL_MAX_UINT32;
+    /* ENGINE-FORK: the highest-versioned device rejected for its API version, kept only to
+     * name it in the error if no device qualifies at all. */
+    bool anyRejectedForVersion = false;
+    VkPhysicalDeviceProperties rejectedForVersion;
+    SDL_zero(rejectedForVersion);
     for (i = 0; i < physicalDeviceCount; i += 1) {
         Uint32 queueFamilyIndex;
         Uint32 computeQueueFamilyIndex, transferQueueFamilyIndex;   /* ENGINE-FORK */
         Uint64 deviceRank;
+
+        /* ENGINE-FORK: the declared instance version is a requirement, not a wish. The
+         * effective device version is min(instance, device), so a device below the declared
+         * one would silently run under a lower contract, and the Vulkan1xFeatures structs
+         * chained into vkCreateDevice would be invalid for it. Patch and variant are ignored:
+         * they carry no capabilities. */
+        if (features->usesCustomVulkanOptions) {
+            VkPhysicalDeviceProperties deviceProperties;
+            renderer->vkGetPhysicalDeviceProperties(physicalDevices[i], &deviceProperties);
+            const Uint32 have = VK_MAKE_API_VERSION(0,
+                VK_API_VERSION_MAJOR(deviceProperties.apiVersion),
+                VK_API_VERSION_MINOR(deviceProperties.apiVersion), 0);
+            const Uint32 need = VK_MAKE_API_VERSION(0,
+                VK_API_VERSION_MAJOR(features->desiredApiVersion),
+                VK_API_VERSION_MINOR(features->desiredApiVersion), 0);
+            if (have < need) {
+                if (!anyRejectedForVersion || deviceProperties.apiVersion > rejectedForVersion.apiVersion) {
+                    rejectedForVersion = deviceProperties;
+                }
+                anyRejectedForVersion = true;
+                continue;
+            }
+        }
 
         if (!VULKAN_INTERNAL_IsDeviceSuitable(
                 renderer,
@@ -12885,6 +12913,18 @@ static Uint8 VULKAN_INTERNAL_DeterminePhysicalDevice(VulkanRenderer *renderer, V
             SDL_stack_free(famProps);
         }
     } else {
+        /* ENGINE-FORK: logged here and not via SDL_SetError: SDL_CreateGPUDevice overwrites the
+         * error with a generic "no backend" once every backend has declined. */
+        if (anyRejectedForVersion) {
+            SDL_LogError(
+                SDL_LOG_CATEGORY_GPU,
+                "Vulkan %u.%u required, but '%s' supports only %u.%u (update the GPU driver)",
+                VK_API_VERSION_MAJOR(features->desiredApiVersion),
+                VK_API_VERSION_MINOR(features->desiredApiVersion),
+                rejectedForVersion.deviceName,
+                VK_API_VERSION_MAJOR(rejectedForVersion.apiVersion),
+                VK_API_VERSION_MINOR(rejectedForVersion.apiVersion));
+        }
         SDL_stack_free(physicalDevices);
         SDL_stack_free(physicalDeviceExtensions);
         return 0;
